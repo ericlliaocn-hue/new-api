@@ -18,6 +18,7 @@ import (
 	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
@@ -525,7 +526,8 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return failTaskFromPoll(ctx, adaptor, task, snap.Status, "Upstream task not found")
 	case pollClassAuth:
 		logger.LogWarn(ctx, common.LogText("task poll auth failure channel_id=%d task=%s http=%d", ch.Id, task.TaskID, resp.StatusCode))
-		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassAuth, resp.StatusCode, "")
+		DisableChannel(*relaytypes.NewChannelError(ch.Id, ch.Type, ch.Name, ch.ChannelInfo.IsMultiKey, key, ch.GetAutoBan()), "upstream video task auth failure")
+		return failTaskFromPoll(ctx, adaptor, task, snap.Status, "upstream auth failure")
 	case pollClassTransient:
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassTransient, resp.StatusCode, "")
 	}
@@ -730,7 +732,7 @@ func classifyPollHTTP(statusCode int) string {
 		return pollClassOK
 	case statusCode == http.StatusNotFound || statusCode == http.StatusGone:
 		return pollClassNotFound
-	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusPaymentRequired || statusCode == http.StatusForbidden:
 		return pollClassAuth
 	case statusCode == http.StatusTooManyRequests || statusCode >= 500:
 		return pollClassTransient
