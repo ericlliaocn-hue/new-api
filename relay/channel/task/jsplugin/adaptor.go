@@ -13,6 +13,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/textproto"
 	"net/url"
 	"reflect"
@@ -29,8 +30,10 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -618,6 +621,142 @@ func (a *TaskAdaptor) ParseResponse(c *gin.Context, resp *http.Response, info *r
 		logger.LogWarn(c, common.LogText("task plugin %s completion usage rejected; retaining reserved quota: %v", a.plugin.Meta.Key, err))
 	}
 	return response, nil
+}
+
+// TryFallback re-submits the original task body to another channel that binds
+// the same task plugin, then points the existing public task at the new
+// upstream task. It is used only after a terminal failure that is safe to
+// retry; auth/content/param/deadline failures are filtered by the caller.
+func (a *TaskAdaptor) TryFallback(ctx context.Context, task *model.Task, failedChannel *model.Channel, fromStatus model.TaskStatus) (bool, error) {
+	// Fallback is enabled only for the pilipala video adapter for now; other
+	// built-in plugins keep their existing single-channel semantics.
+	if a.plugin.Meta.Key != "pilipala-video" {
+		return false, nil
+	}
+	if task == nil || failedChannel == nil || len(task.PrivateData.FallbackRequest) == 0 {
+		logger.LogWarn(ctx, "fallback skipped: missing task/channel/body")
+		return false, nil
+	}
+	logger.LogInfo(ctx, common.LogText("fallback starting task=%s failed_channel=%d model=%s group=%s", task.TaskID, failedChannel.Id, task.Properties.OriginModelName, task.Group))
+	if task.PrivateData.FallbackAttempts >= 1 {
+		return false, nil
+	}
+	modelName := strings.TrimSpace(task.Properties.OriginModelName)
+	if modelName == "" {
+		modelName = strings.TrimSpace(task.Properties.UpstreamModelName)
+	}
+	if modelName == "" {
+		return false, nil
+	}
+	used := map[int]bool{failedChannel.Id: true}
+	for _, channelID := range task.PrivateData.FallbackChannels {
+		used[channelID] = true
+	}
+	var next *model.Channel
+	for retry := 0; retry < 4; retry++ {
+		candidate, err := model.GetRandomSatisfiedChannel(task.Group, modelName, retry, nil)
+		if err != nil {
+			return false, err
+		}
+		if candidate == nil {
+			break
+		}
+		if used[candidate.Id] || candidate.Status != common.ChannelStatusEnabled {
+			continue
+		}
+		if !candidate.GetSetting().BindsTaskPlugin(a.plugin.Meta.Key) {
+			continue
+		}
+		next = candidate
+		break
+	}
+	if next == nil {
+		logger.LogWarn(ctx, "fallback skipped: no alternate channel")
+		return false, nil
+	}
+	logger.LogInfo(ctx, common.LogText("fallback selected channel=%d", next.Id))
+
+	upstreamModel := strings.TrimSpace(task.Properties.UpstreamModelName)
+	if upstreamModel == "" {
+		upstreamModel = modelName
+	}
+	info := &relaycommon.RelayInfo{
+		UserId:          task.UserId,
+		TokenId:         task.PrivateData.TokenId,
+		TokenGroup:      task.Group,
+		UsingGroup:      task.Group,
+		OriginModelName: modelName,
+		RelayFormat:     relaytypes.RelayFormatTask,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:            next.Id,
+			ChannelType:          next.Type,
+			ChannelBaseUrl:       next.GetBaseURL(),
+			ApiKey:               next.Key,
+			ChannelSetting:       next.GetSetting(),
+			ChannelOtherSettings: next.GetOtherSettings(),
+			UpstreamModelName:    upstreamModel,
+		},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{Action: task.Action, PublicTaskID: task.TaskID},
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(task.PrivateData.FallbackRequest))
+	contentType := strings.TrimSpace(task.PrivateData.FallbackContentType)
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	c.Request.Header.Set("Content-Type", contentType)
+	var requestBody map[string]any
+	if err := common.Unmarshal(task.PrivateData.FallbackRequest, &requestBody); err != nil {
+		return false, fmt.Errorf("fallback body: %w", err)
+	}
+	c.Set("task_request", requestBody)
+	c.Set("task_action", task.Action)
+	info.Action = task.Action
+	if info.TaskRelayInfo != nil {
+		info.TaskRelayInfo.Action = task.Action
+	}
+
+	a.Init(info)
+	if taskErr := a.ValidateRequestAndSetAction(c, info); taskErr != nil {
+		logger.LogWarn(ctx, common.LogText("fallback validate failed: %s", taskErr.Message))
+		return false, fmt.Errorf("fallback validate: %s", taskErr.Message)
+	}
+	body, err := a.BuildRequestBody(c, info)
+	if err != nil {
+		return false, err
+	}
+	resp, err := a.DoRequest(c, info, body)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	parsed, taskErr := a.ParseResponse(c, resp, info)
+	if taskErr != nil {
+		logger.LogWarn(ctx, common.LogText("fallback submit failed: %s", taskErr.Message))
+		return false, fmt.Errorf("fallback submit: %s", taskErr.Message)
+	}
+	logger.LogInfo(ctx, common.LogText("fallback submit ok upstream=%s", parsed.UpstreamTaskID))
+	if parsed == nil || strings.TrimSpace(parsed.UpstreamTaskID) == "" || parsed.Immediate != nil {
+		return false, nil
+	}
+	task.ChannelId = next.Id
+	task.Status = model.TaskStatusSubmitted
+	task.Progress = taskcommon.ProgressSubmitted
+	task.FailReason = ""
+	task.FinishTime = 0
+	task.Data = parsed.TaskData
+	task.PrivateData.UpstreamTaskID = parsed.UpstreamTaskID
+	task.PrivateData.PluginState = parsed.PluginState
+	task.PrivateData.PollFailures = 0
+	task.PrivateData.ResultURL = ""
+	task.PrivateData.FallbackAttempts++
+	task.PrivateData.FallbackChannels = append(task.PrivateData.FallbackChannels, failedChannel.Id)
+	won, err := task.UpdateWithStatus(fromStatus)
+	if err != nil {
+		return false, err
+	}
+	return won, nil
 }
 
 func (a *TaskAdaptor) GetModelList() []string { return append([]string(nil), a.plugin.Meta.Models...) }

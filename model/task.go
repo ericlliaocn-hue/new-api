@@ -137,6 +137,12 @@ type TaskPrivateData struct {
 	// and every retrieval surface treats the task as not found. The zero
 	// value keeps historical rows retained and retrievable.
 	ResultDiscarded bool `json:"result_discarded,omitempty"`
+	// FallbackRequest is the original client task body, kept only for a
+	// channel-level re-submit after a terminal task failure. It is private.
+	FallbackRequest     []byte `json:"fallback_request,omitempty"`
+	FallbackContentType string `json:"fallback_content_type,omitempty"`
+	FallbackAttempts    int    `json:"fallback_attempts,omitempty"`
+	FallbackChannels    []int  `json:"fallback_channels,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {

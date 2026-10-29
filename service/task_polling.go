@@ -41,6 +41,12 @@ type BatchTaskPollingAdaptor interface {
 	ParseBatchResult(tasks []*model.Task, resp *http.Response, body []byte) (map[string]*BatchTaskResult, error)
 }
 
+// TaskFallbackAdaptor is implemented by task adaptors that can re-submit the
+// original task body to another channel while keeping the public task ID.
+type TaskFallbackAdaptor interface {
+	TryFallback(ctx context.Context, task *model.Task, failedChannel *model.Channel, fromStatus model.TaskStatus) (bool, error)
+}
+
 const (
 	pollClassOK           = "ok"
 	pollClassOtherClient  = "other_client"
@@ -558,6 +564,22 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return recordPollFailure(ctx, adaptor, task, snap.Status, pollClassUnrecognized, resp.StatusCode, unrecognizedPollDetail(taskResult.Reason, responseBody))
 	}
 
+	if parsedStatus == model.TaskStatusFailure && shouldAttemptTaskFallback(taskResult.Reason) {
+		logger.LogWarn(ctx, common.LogText("task %s fallback check adaptor=%T reason=%q", task.TaskID, adaptor, taskResult.Reason))
+		if fallback, ok := adaptor.(TaskFallbackAdaptor); ok {
+			done, fallbackErr := fallback.TryFallback(ctx, task, ch, snap.Status)
+			if fallbackErr != nil {
+				logger.LogWarn(ctx, common.LogText("task %s fallback failed: %s", task.TaskID, fallbackErr.Error()))
+			} else if done {
+				return nil
+			} else {
+				logger.LogWarn(ctx, common.LogText("task %s fallback not applied", task.TaskID))
+			}
+		} else {
+			logger.LogWarn(ctx, common.LogText("task %s adaptor has no fallback", task.TaskID))
+		}
+	}
+
 	task.Data = redactVideoResponseBody(responseBody)
 	if len(taskResult.PluginState) > 0 {
 		task.PrivateData.PluginState = taskResult.PluginState
@@ -741,6 +763,18 @@ func classifyPollHTTP(statusCode int) string {
 	default:
 		return pollClassTransient
 	}
+}
+
+// shouldAttemptTaskFallback keeps auth/content/param/deadline failures out of
+// channel fallback; those need a channel fuse, a user decision, or a new request.
+func shouldAttemptTaskFallback(reason string) bool {
+	lower := strings.ToLower(reason)
+	for _, skip := range []string{"auth", "deadline", "content", "moderation", "face", "policy", "parameter", "schema"} {
+		if strings.Contains(lower, skip) {
+			return false
+		}
+	}
+	return true
 }
 
 func knownPollStatus(status model.TaskStatus) bool {

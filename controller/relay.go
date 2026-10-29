@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -477,6 +478,20 @@ func RelayTask(c *gin.Context) {
 		relayInfo.Action = action
 	}
 
+	// Keep a bounded copy of the original task body for a channel-level
+	// fallback re-submit. The body is already needed by the relay; restore it
+	// so capture is transparent to every downstream reader.
+	const maxFallbackRequestBytes = 1 << 20
+	if c.Request != nil && c.Request.Body != nil && c.Request.ContentLength > 0 &&
+		c.Request.ContentLength <= maxFallbackRequestBytes {
+		rawBody, readErr := io.ReadAll(c.Request.Body)
+		if readErr == nil {
+			c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+			c.Set("pilipala_fallback_request", rawBody)
+			c.Set("pilipala_fallback_content_type", c.GetHeader("Content-Type"))
+		}
+	}
+
 	if taskErr := relay.ResolveOriginTask(c, relayInfo); taskErr != nil {
 		respondTaskSubmissionError(c, taskErr)
 		return
@@ -664,6 +679,12 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	if rawBody, ok := c.Get("pilipala_fallback_request"); ok {
+		if body, ok := rawBody.([]byte); ok && len(body) > 0 {
+			task.PrivateData.FallbackRequest = append([]byte(nil), body...)
+			task.PrivateData.FallbackContentType = c.GetString("pilipala_fallback_content_type")
+		}
+	}
 	if clientRequestID := strings.TrimSpace(c.GetString("pilipala_client_request_id")); clientRequestID != "" {
 		task.ClientRequestID = &clientRequestID
 	}
