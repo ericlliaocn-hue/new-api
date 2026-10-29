@@ -485,6 +485,19 @@ func RelayTask(c *gin.Context) {
 		respondTaskSubmissionError(c, taskErr)
 		return
 	}
+	clientRequestID := strings.TrimSpace(c.GetHeader("X-Pilipala-Request-Id"))
+	if clientRequestID != "" {
+		existing, found, lookupErr := model.FindByClientRequestID(relayInfo.UserId, clientRequestID)
+		if lookupErr != nil {
+			respondTaskSubmissionError(c, service.TaskErrorWrapper(lookupErr, "idempotency_lookup_failed", http.StatusInternalServerError))
+			return
+		}
+		if found {
+			presentTaskSubmission(c, &taskSubmissionOutcome{Task: existing, RelayInfo: relayInfo})
+			return
+		}
+		c.Set("pilipala_client_request_id", clientRequestID)
+	}
 
 	outcome, taskErr := executeTaskSubmission(c, relayInfo)
 	if taskErr != nil {
@@ -651,6 +664,9 @@ func executeTaskSubmissionWith(
 
 	stage = "insert"
 	task := model.InitTask(result.Platform, relayInfo)
+	if clientRequestID := strings.TrimSpace(c.GetString("pilipala_client_request_id")); clientRequestID != "" {
+		task.ClientRequestID = &clientRequestID
+	}
 	task.PrivateData.Execution = service.TaskExecutionSnapshotFromContext(c)
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.BillingSource = relayInfo.BillingSource
