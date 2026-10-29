@@ -21,6 +21,35 @@ function upstreamModel(ctx) {
   return text(ctx.upstreamModel) || text(ctx.model);
 }
 
+const DEFAULT_TIMEOUT_SECONDS = 900;
+const MAX_TIMEOUT_SECONDS = 7200;
+
+function headerValue(headers, name) {
+  const wanted = name.toLowerCase();
+  const source = headers && typeof headers === "object" ? headers : {};
+  for (const key of Object.keys(source)) {
+    if (key.toLowerCase() === wanted) return text(source[key]);
+  }
+  return "";
+}
+
+function timeoutSecondsOf(ctx) {
+  const raw = Number(headerValue(ctx.requestHeaders, "X-Pilipala-Timeout-Seconds"));
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(MAX_TIMEOUT_SECONDS, Math.max(1, Math.floor(raw)));
+}
+
+function deadlineOf(ctx) {
+  return Number(ctx.state && ctx.state.deadlineAt) || 0;
+}
+
+function submitDeadlineOf(ctx) {
+  const fixed = Number(headerValue(ctx.requestHeaders, "X-Pilipala-Deadline-At"));
+  if (Number.isFinite(fixed) && fixed > 0) return Math.floor(fixed);
+  const seconds = timeoutSecondsOf(ctx) || DEFAULT_TIMEOUT_SECONDS;
+  return Date.now() + seconds * 1000;
+}
+
 function durationOf(value) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : 0;
@@ -71,11 +100,16 @@ export function buildSubmitRequest(ctx) {
   };
 }
 
-export function parseSubmitResponse(_ctx, response) {
+export function parseSubmitResponse(ctx, response) {
   const body = bodyOf(response);
   const result = resultOf(body);
   if (!result.id) throw new Error("upstream task id is empty");
-  return { taskId: result.id, taskData: body };
+  const seconds = timeoutSecondsOf(ctx) || DEFAULT_TIMEOUT_SECONDS;
+  return {
+    taskId: result.id,
+    taskData: body,
+    state: { deadlineAt: submitDeadlineOf(ctx), timeoutSeconds: seconds },
+  };
 }
 
 export function buildQueryRequest(ctx) {
@@ -86,7 +120,7 @@ export function buildQueryRequest(ctx) {
   };
 }
 
-export function parseTaskResult(_ctx, body, response) {
+export function parseTaskResult(ctx, body, response) {
   if (response && response.status === 429) {
     return { status: "UNKNOWN", reason: "upstream rate limited" };
   }
@@ -103,6 +137,9 @@ export function parseTaskResult(_ctx, body, response) {
   }
   if (status.startsWith("FAILED") || status.startsWith("FAILURE") || status.startsWith("ERROR") || status.startsWith("CANCELLED")) {
     return { status: "FAILURE", reason: result.message || result.status || "upstream task failed" };
+  }
+  if (deadlineOf(ctx) > 0 && Date.now() >= deadlineOf(ctx)) {
+    return { status: "FAILURE", reason: "task deadline exceeded" };
   }
   if (status.startsWith("RUNNING") || status.startsWith("QUEUED") || status.startsWith("PENDING") || status.startsWith("PROCESSING")) {
     return { status: "IN_PROGRESS" };

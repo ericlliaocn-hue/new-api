@@ -23,12 +23,13 @@
       "name": "parse submit response",
       "hook": "parseSubmitResponse",
       "args": [
-        {},
+        { "requestHeaders": { "X-Pilipala-Deadline-At": "1700000000000" } },
         { "body": { "id": "task-1", "status": "RUNNING" } }
       ],
       "expected": {
         "taskId": "task-1",
-        "taskData": { "id": "task-1", "status": "RUNNING" }
+        "taskData": { "id": "task-1", "status": "RUNNING" },
+        "state": { "deadlineAt": 1700000000000, "timeoutSeconds": 900 }
       }
     },
     {
@@ -62,6 +63,26 @@
         { "status": 200 }
       ],
       "expected": { "status": "FAILURE", "reason": "bad prompt" }
+    },
+    {
+      "name": "deadline fails a running task",
+      "hook": "parseTaskResult",
+      "args": [
+        { "state": { "deadlineAt": 1 } },
+        { "status": "RUNNING" },
+        { "status": 200 }
+      ],
+      "expected": { "status": "FAILURE", "reason": "task deadline exceeded" }
+    },
+    {
+      "name": "success wins even after deadline",
+      "hook": "parseTaskResult",
+      "args": [
+        { "state": { "deadlineAt": 1 } },
+        { "status": "SUCCEEDED", "object": "https://cdn.example/v.mp4" },
+        { "status": 200 }
+      ],
+      "expected": { "status": "SUCCESS", "url": "https://cdn.example/v.mp4" }
     },
     {
       "name": "decode openai video request",
