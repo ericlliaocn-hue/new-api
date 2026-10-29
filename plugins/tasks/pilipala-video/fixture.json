@@ -1,0 +1,95 @@
+{
+  "cases": [
+    {
+      "name": "build submit request",
+      "hook": "buildSubmitRequest",
+      "args": [
+        {
+          "baseUrl": "http://127.0.0.1:18091",
+          "apiKey": "fake",
+          "model": "sd-2-c4",
+          "upstreamModel": "sd-2-c4",
+          "requestBody": { "prompt": "a red ball", "duration": 4, "size": "1280x720" }
+        }
+      ],
+      "expected": {
+        "url": "http://127.0.0.1:18091/v1/video/generations",
+        "method": "POST",
+        "headers": { "Authorization": "Bearer fake", "Content-Type": "application/json" },
+        "body": { "model": "sd-2-c4", "prompt": "a red ball", "duration": 4, "size": "1280x720" }
+      }
+    },
+    {
+      "name": "parse submit response",
+      "hook": "parseSubmitResponse",
+      "args": [
+        {},
+        { "body": { "id": "task-1", "status": "RUNNING" } }
+      ],
+      "expected": {
+        "taskId": "task-1",
+        "taskData": { "id": "task-1", "status": "RUNNING" }
+      }
+    },
+    {
+      "name": "build query request",
+      "hook": "buildQueryRequest",
+      "args": [
+        { "baseUrl": "http://127.0.0.1:18091", "apiKey": "fake", "taskId": "task-1" }
+      ],
+      "expected": {
+        "url": "http://127.0.0.1:18091/v1/video/generations/task-1",
+        "method": "GET",
+        "headers": { "Authorization": "Bearer fake" }
+      }
+    },
+    {
+      "name": "parse success result",
+      "hook": "parseTaskResult",
+      "args": [
+        {},
+        { "status": "SUCCEEDED", "object": "https://cdn.example/v.mp4" },
+        { "status": 200 }
+      ],
+      "expected": { "status": "SUCCESS", "url": "https://cdn.example/v.mp4" }
+    },
+    {
+      "name": "parse failed result",
+      "hook": "parseTaskResult",
+      "args": [
+        {},
+        { "status": "FAILED: bad prompt", "message": "bad prompt" },
+        { "status": 200 }
+      ],
+      "expected": { "status": "FAILURE", "reason": "bad prompt" }
+    },
+    {
+      "name": "decode openai video request",
+      "hook": "protocols",
+      "path": ["openai_video", "decodeRequest"],
+      "args": [
+        {
+          "model": "sd-2-c4",
+          "body": {
+            "kind": "json",
+            "value": { "model": "sd-2-c4", "prompt": "hi", "duration": 4, "size": "1280x720" }
+          }
+        }
+      ],
+      "expected": {
+        "kind": "submit",
+        "model": "sd-2-c4",
+        "action": "text_to_video",
+        "requestBody": { "model": "sd-2-c4", "prompt": "hi", "duration": 4, "size": "1280x720" }
+      }
+    },
+    {
+      "name": "list video artifact",
+      "hook": "listArtifacts",
+      "args": [
+        { "status": "SUCCESS", "action": "text_to_video", "data": {}, "taskId": "task-1", "producerVersion": "0.1.0" }
+      ],
+      "expected": [{ "key": "video", "type": "video" }]
+    }
+  ]
+}
